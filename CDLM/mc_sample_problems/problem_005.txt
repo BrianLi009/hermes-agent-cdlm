@@ -1,0 +1,2 @@
+An unusual bishop is a chess piece that can be turned towards any of the four diagonally adjacent squares and can attack any square that is either in front of it or left or right of it (similar as the usual bishop with the exception that it cannot see behind itself).
+Two fields of the chessboard are diagonally adjacent if they share exactly one common vertex. Your task is to place at least $20$ unusual bishops on the $8 \times 8$ chessboard so that no bishop can attack another.

@@ -1,0 +1,5 @@
+# Dependencies for visualization
+matplotlib>=3.5.0
+networkx>=2.6.0
+pygraphviz>=1.9  # Optional: for better hierarchical layout of DAGs
+pydantic-ai>=1.55.0

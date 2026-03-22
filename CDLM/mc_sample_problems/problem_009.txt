@@ -1,0 +1,6 @@
+Let $n$ be an odd positive integer. On a circle there are $n$ identical tokens, of which some are black, and the rest white. For $k \in \{1, 2, \ldots, n-1\}$, we define the "quality" of the number $k$ as follows: if we move every token $k$ steps in the clockwise direction, the quality of $k$ is the number of positions where the color of the token did not change. 
+
+We can prove that for every $n$ there exists some $k \in \{1, 2, \ldots, n-1\}$ such that the quality of $k$ is at least $\frac{n-1}{2}$.
+
+We also know that there are infinitely many odd positive integers $n$ for which there exists a configuration of white and black tokens, such that no $k$ has quality bigger than $\frac{n-1}{2}$.
+Find $6$ distinct such numbers $n$, and for each, find a configuration of white and black tokens that satisfies the above condition (no $k$ has quality above $\frac{n-1}{2}$).

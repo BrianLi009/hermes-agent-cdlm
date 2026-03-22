@@ -1,0 +1,8 @@
+Solve the following sudoku puzzle:
+
+[4,1,_,3]
+[_,3,4,_]
+[_,4,3,_]
+[3,_,1,4]
+
+Rules: Each row, column, and 2x2 box must contain the numbers 1-4 exactly once.

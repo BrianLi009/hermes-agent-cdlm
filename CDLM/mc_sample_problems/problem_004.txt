@@ -1,0 +1,1 @@
+Let $n = 6$ be an integer. Consider an $n \times n$ chessboard with the usual chessboard colouring. A move consists of choosing a $1 \times 1$ square and switching the colour of all squares in its row and column (including the chosen square itself). Find a sequence of moves such that after executing them we get a monochrome chessboard.

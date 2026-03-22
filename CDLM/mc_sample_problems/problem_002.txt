@@ -1,0 +1,1 @@
+We will call a graph $G$ a divisibility graph if a distinct natural number can be written in each of its vertices such that its edges correspond to all pairs $(u, v)$ for which either $\frac{u}{v}$ or $\frac{v}{u}$ is an integer. Exhibit a divisibility graph with exactly $15$ vertices and $43$ edges.

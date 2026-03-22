@@ -1,0 +1,3 @@
+There are $2n$ students in a school ($n \in N, n \geq 2$). Each week $n$ students go on a trip.
+Given $n = 10$, your task is to organize 6 trips such that every two students go together on at least one trip. Present your solution 
+in the form of a 6 x $2n$ matrix $A$ such that $A_{ij} = 1$ if student $j$ goes on trip $i$ and $A_{ij} = 0$ otherwise.

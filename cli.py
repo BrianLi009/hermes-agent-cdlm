@@ -2786,6 +2786,13 @@ class HermesCLI:
             if hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
+            # Deactivate CDLM tools on session reset
+            try:
+                from tools.cdlm_tool import deactivate_cdlm
+                deactivate_cdlm()
+            except Exception:
+                pass
+
             if self._session_db:
                 try:
                     self._session_db.create_session(
@@ -3767,6 +3774,13 @@ class HermesCLI:
                 )
                 if msg:
                     skill_name = _skill_commands[base_cmd]["name"]
+                    # Activate CDLM tools when the /cdlm skill is invoked
+                    if skill_name == "cdlm":
+                        try:
+                            from tools.cdlm_tool import activate_cdlm
+                            activate_cdlm()
+                        except Exception:
+                            pass
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
                         self._pending_input.put(msg)

@@ -1,0 +1,49 @@
+Example: How the Candidate Information Appears in Decision Prompts
+====================================================================
+
+When the decision agent is called, it now receives information like this:
+
+Valid candidates for empty cells (based on current grid state):
+
+  Cell (1,5): [4]
+  Cell (2,3): [7]
+  Cell (2,8): [1]
+  Cell (3,1): [2]
+  Cell (3,6): [7]
+  Cell (3,9): [3]
+  Cell (4,1): [4]
+  Cell (4,3): [9]
+  Cell (4,6): [5]
+  Cell (5,4): [7]
+  Cell (6,2): [4]
+  Cell (6,9): [4]
+  Cell (7,2): [4]
+  Cell (8,4): [8]
+  Cell (9,2): [9]
+  Cell (9,6): [3]
+  Cell (1,8): [1, 2]
+  Cell (2,5): [4, 6]
+  Cell (3,4): [1, 7]
+  Cell (3,5): [6, 9]
+  ... and 20 more empty cells
+
+Note: Cells with fewer candidates are more constrained and often better choices for decisions.
+
+IMPORTANT: When making a decision about a cell value, you MUST choose from the valid candidates listed above. Choosing an invalid value will lead to a conflict. Prefer cells with fewer candidates as they are more constrained and lead to faster solutions.
+
+
+Benefits:
+---------
+1. Prevents hallucination: The model can only choose valid values
+2. Improves decision quality: Cells with single candidates (like (1,5): [4]) 
+   can be immediately assigned
+3. Better branching: The model focuses on constrained cells first
+4. Faster convergence: Reduces conflicts and backtracking
+
+Implementation Details:
+----------------------
+- sudoku_helpers.py: Contains all domain-specific logic
+- solve.py: decide() method calls get_candidates_info_for_decision()
+- decision_user_prompt.md: Updated to include $CANDIDATES placeholder
+- Modular design: Easy to disable or adapt for other problem types
+

@@ -1,0 +1,3 @@
+There are $n = 25$ hoops in a circle. Rik numbers all hoops with a natural number between $1$ and $n$ such that each number occurs exactly once. After that, he makes a walk from hoop to hoop. He starts in hoop with number 1 and follows the following rule: If he arrives in hoop $k$, he moves to the hoop that is $k$ hoops away in the clockwise direction and skips the intermediate hoops. The walk ends when Rik arrives in a hoop he has already visited. The length of the walk is the number of hoops he has visited along the way.
+
+Give a numbering of the $25$ hoops such that the length of the walk is $25$.

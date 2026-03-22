@@ -1,0 +1,1 @@
+Consider the points $A = (4, 0)$, $B = (0, 3)$ and $C=(0,0)$ in the plane. Find a pair of points $P$ and $Q$ on ABC that divide the perimeter of the triangle in half and such that PQ divides the area of the triangle in half.

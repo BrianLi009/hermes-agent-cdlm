@@ -64,6 +64,9 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # CDLM reasoning tools (gated on /cdlm activation via check_fn)
+    "cdlm_init", "cdlm_propagate", "cdlm_conflict_check",
+    "cdlm_decide", "cdlm_solution_check", "cdlm_backtrack", "cdlm_status",
 ]
 
 

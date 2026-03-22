@@ -1,0 +1,1 @@
+Find a 31-digit integer N that is an integer multiple of $2^{ 31 }$ and whose digits consist only of digits 8 and 9.
