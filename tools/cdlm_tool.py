@@ -3,8 +3,17 @@
 CDLM Tool — Conflict-Driven Learning for Mathematical Reasoning
 
 Exposes the CDLM solver as a set of Hermes tools with state-machine-enforced
-transitions.  The LLM controls pacing (e.g. multiple propagations before a
-conflict check) while code enforces that invalid transitions cannot happen.
+transitions. The *calling* LLM is the reasoning engine: it produces the
+deductions, conflict findings, decisions, and solutions itself, and passes
+them in as tool arguments. The tools handle:
+
+  * State machine validation (so the loop is run in a valid order)
+  * Reasoning-tree bookkeeping (parent tracking, decision levels, lemmas)
+  * Pure-Python conflict analysis (1-UIP / learned clause / backjump level)
+
+NO external LLM API key is required. Earlier versions of this tool delegated
+each phase to ``gpt-4.1`` via ``pydantic-ai``; that made no sense for an agent
+skill, where the host LLM is already the agent.
 
 State machine:
     INIT            → can: propagate
@@ -16,21 +25,19 @@ State machine:
 
 Tools registered:
     cdlm_init           — create a session with a problem statement
-    cdlm_propagate      — derive logical implications from the current tree
-    cdlm_conflict_check — check for contradictions in the tree
-    cdlm_decide         — make an assumption to explore the search space
-    cdlm_solution_check — check if the problem has been solved
-    cdlm_backtrack      — analyze conflict, learn a lemma, and backjump
+    cdlm_propagate      — add caller-supplied implications to the tree
+    cdlm_conflict_check — record whether the caller found a contradiction
+    cdlm_decide         — add a caller-chosen assumption to the tree
+    cdlm_solution_check — record whether the caller has a complete solution
+    cdlm_backtrack      — run conflict analysis, backjump, store lemma
     cdlm_status         — show current session state (tree, state, problem)
 """
 
 import json
 import logging
-import os
 import sys
 from pathlib import Path
-from string import Template
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -58,41 +65,34 @@ VALID_TRANSITIONS = {
 
 # ---------------------------------------------------------------------------
 # CDLM imports (lazy, from the CDLM subdir)
+#
+# We only need ``problem_structure`` (Tree / Problem / pydantic models for the
+# node payloads) and ``conflict_analysis`` (pure-Python 1-UIP). We deliberately
+# do NOT import ``agents`` — that module pulls in pydantic-ai/OpenAI and is
+# only needed by the standalone research script (CDLM/solve.py).
 # ---------------------------------------------------------------------------
 
 _CDLM_DIR = Path(__file__).resolve().parent.parent / "CDLM"
 
 
 def _ensure_cdlm_path():
-    """Add CDLM directory to sys.path so its modules can be imported."""
     cdlm_str = str(_CDLM_DIR)
     if cdlm_str not in sys.path:
         sys.path.insert(0, cdlm_str)
 
 
 def _get_cdlm_modules():
-    """Lazy-import CDLM modules.
-
-    CDLM's agents.py reads prompt files via relative paths, so we temporarily
-    chdir into the CDLM directory during import.
-    """
+    """Lazy-import the pure-Python CDLM modules."""
     _ensure_cdlm_path()
-    import os
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(str(_CDLM_DIR))
-        from problem_structure import Tree, Problem, Deduction, Decision, Conflict, Solution
-        from conflict_analysis import ConflictAnalyzer, analyze_and_print
-        from agents import create_agents
-        from agents import (
-            prop_user_prompt,
-            conflict_detection_user_prompt,
-            decision_user_prompt,
-            solution_checker_user_prompt,
-            lemma_deducer_user_prompt,
-        )
-    finally:
-        os.chdir(old_cwd)
+    from problem_structure import (
+        Tree,
+        Problem,
+        Deduction,
+        Decision,
+        Conflict,
+        Solution,
+    )
+    from conflict_analysis import ConflictAnalyzer
     return {
         "Tree": Tree,
         "Problem": Problem,
@@ -101,13 +101,6 @@ def _get_cdlm_modules():
         "Conflict": Conflict,
         "Solution": Solution,
         "ConflictAnalyzer": ConflictAnalyzer,
-        "analyze_and_print": analyze_and_print,
-        "create_agents": create_agents,
-        "prop_user_prompt": prop_user_prompt,
-        "conflict_detection_user_prompt": conflict_detection_user_prompt,
-        "decision_user_prompt": decision_user_prompt,
-        "solution_checker_user_prompt": solution_checker_user_prompt,
-        "lemma_deducer_user_prompt": lemma_deducer_user_prompt,
     }
 
 
@@ -116,10 +109,6 @@ def _get_cdlm_modules():
 # ---------------------------------------------------------------------------
 
 _sessions: Dict[str, Dict[str, Any]] = {}
-
-# Default definitions (match CDLM solve.py defaults)
-DEFAULT_DEDUCTION = "An implication that must be logically derived from existing knowledge (parents)."
-DEFAULT_DECISION = "An assumption or design decision that need not be implied but is assumed to explore the solution space."
 
 
 def _get_session(task_id: str) -> Optional[Dict[str, Any]]:
@@ -140,16 +129,24 @@ def _validate_transition(session: Dict[str, Any], action: str) -> Optional[str]:
     return None
 
 
+def _allowed_actions(session: Dict[str, Any]) -> List[str]:
+    return sorted(VALID_TRANSITIONS.get(session["state"], set()))
+
+
 def _tree_summary(session: Dict[str, Any]) -> str:
-    """Return a concise summary of the tree state."""
     tree = session["tree"]
-    node_count = len(tree.nodes)
-    decision_level = tree.curr_decision_level
-    state = session["state"]
     return (
-        f"State: {state} | Nodes: {node_count} | "
-        f"Decision level: {decision_level}"
+        f"State: {session['state']} | Nodes: {len(tree.nodes)} | "
+        f"Decision level: {tree.curr_decision_level}"
     )
+
+
+def _err(message: str, session: Optional[Dict[str, Any]] = None) -> str:
+    payload: Dict[str, Any] = {"error": message}
+    if session is not None:
+        payload["status"] = _tree_summary(session)
+        payload["allowed_actions"] = _allowed_actions(session)
+    return json.dumps(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -160,18 +157,17 @@ def cdlm_init(problem_text: str, problem_type: str = "general", **kwargs) -> str
     """Initialize a CDLM session with a problem statement."""
     task_id = kwargs.get("task_id", "default")
 
+    if not problem_text or not problem_text.strip():
+        return _err("problem_text is required and cannot be empty.")
+
     m = _get_cdlm_modules()
     problem = m["Problem"](problem_text)
     tree = m["Tree"]()
-
-    # Create LLM agents for the session
-    agents = m["create_agents"](
-        use_code_prop=False,
-        use_code_decision=False,
-        use_code_solution=False,
-        use_code_conflict=False,
-    )
-    prop_agent, conflict_agent, decision_agent, solution_agent, lemma_agent = agents
+    # The default Tree uses curr_decision_level=1, which causes the very first
+    # propagation batch (i.e. the level-0 "givens") to be filed at level 1.
+    # Override to 0 so initial deductions land at level 0; the first call to
+    # cdlm_decide will then bump curr_decision_level to 1 as expected.
+    tree.curr_decision_level = 0
 
     session = {
         "problem": problem,
@@ -179,16 +175,8 @@ def cdlm_init(problem_text: str, problem_type: str = "general", **kwargs) -> str
         "problem_type": problem_type,
         "state": "INIT",
         "iteration": 0,
-        "agents": {
-            "prop": prop_agent,
-            "conflict": conflict_agent,
-            "decision": decision_agent,
-            "solution": solution_agent,
-            "lemma": lemma_agent,
-        },
         "modules": m,
     }
-
     _sessions[task_id] = session
 
     return json.dumps({
@@ -196,277 +184,334 @@ def cdlm_init(problem_text: str, problem_type: str = "general", **kwargs) -> str
         "message": f"CDLM session initialized for problem type '{problem_type}'.",
         "problem": str(problem),
         "status": _tree_summary(session),
+        "allowed_actions": _allowed_actions(session),
     })
 
 
-def cdlm_propagate(**kwargs) -> str:
-    """Derive logical implications from the current reasoning tree."""
+def cdlm_propagate(deductions: List[Dict[str, Any]], **kwargs) -> str:
+    """Add caller-supplied implications to the reasoning tree.
+
+    Each deduction is a dict with:
+      - text   (str): the actual statement, e.g. "Cell(0,1) = 2"
+      - reasoning (str): why this follows from its parents
+      - parents (list[int]): IDs of existing nodes that imply this one
+                              (empty list for level-0 givens with no antecedents)
+    """
     task_id = kwargs.get("task_id", "default")
     session = _get_session(task_id)
     if not session:
-        return json.dumps({"error": "No active CDLM session. Call cdlm_init first."})
+        return _err("No active CDLM session. Call cdlm_init first.")
 
     err = _validate_transition(session, "propagate")
     if err:
-        return json.dumps({"error": err})
+        return _err(err, session)
+
+    if deductions is None:
+        deductions = []
+    if not isinstance(deductions, list):
+        return _err("deductions must be a list of {text, reasoning, parents} dicts.", session)
 
     m = session["modules"]
-    prop_agent = session["agents"]["prop"]
-    problem = session["problem"]
     tree = session["tree"]
 
-    user_prompt = Template(m["prop_user_prompt"]).substitute({
-        "PROBLEM": str(problem),
-        "REASONING_TREE": str(tree),
-        "DEFINITION": DEFAULT_DEDUCTION,
-    })
+    Deduction = m["Deduction"]
+    parsed: List[Any] = []
+    for i, d in enumerate(deductions):
+        if not isinstance(d, dict):
+            return _err(f"deductions[{i}] must be a dict, got {type(d).__name__}.", session)
+        text = d.get("text")
+        if not text:
+            return _err(f"deductions[{i}].text is required.", session)
+        reasoning = d.get("reasoning", "")
+        parents = d.get("parents", []) or []
+        if not isinstance(parents, list) or not all(isinstance(p, int) for p in parents):
+            return _err(f"deductions[{i}].parents must be a list of integers.", session)
+        try:
+            parsed.append(Deduction(text=text, reasoning=reasoning, parents=parents))
+        except Exception as exc:
+            return _err(f"deductions[{i}] failed validation: {exc}", session)
 
-    from pydantic_ai.usage import UsageLimits
-    from pydantic_ai.exceptions import UsageLimitExceeded
+    nodes_before = set(tree.nodes.keys())
+    tree.append_deductions(parsed)
+    nodes_after = set(tree.nodes.keys())
+    new_ids = sorted(nodes_after - nodes_before)
 
-    deductions = []
-    try:
-        deductions = prop_agent.run_sync(
-            user_prompt, usage_limits=UsageLimits(tool_calls_limit=5)
-        ).output
-    except UsageLimitExceeded as e:
-        logger.warning("Usage limit hit on prop agent: %s", e)
-
-    tree.append_deductions(deductions)
     session["state"] = "PROPAGATED"
 
-    deduction_texts = [d.text for d in deductions]
     return json.dumps({
         "success": True,
-        "deductions_count": len(deductions),
-        "deductions": deduction_texts,
+        "deductions_submitted": len(parsed),
+        "deductions_added": len(new_ids),
+        "new_node_ids": new_ids,
         "status": _tree_summary(session),
+        "allowed_actions": _allowed_actions(session),
         "tree": str(tree),
     })
 
 
-def cdlm_conflict_check(**kwargs) -> str:
-    """Check for contradictions in the reasoning tree."""
+def cdlm_conflict_check(
+    is_conflict: bool,
+    reasoning: str = "",
+    parents: Optional[List[int]] = None,
+    **kwargs,
+) -> str:
+    """Record whether the caller found a contradiction in the current tree.
+
+    Args:
+      is_conflict: True if the caller has identified a contradiction.
+      reasoning:   The caller's explanation (always recommended).
+      parents:     Required when is_conflict=True — node IDs whose joint
+                   assignments produce the contradiction. These become the
+                   parents of the CONFLICT node and seed conflict analysis.
+    """
     task_id = kwargs.get("task_id", "default")
     session = _get_session(task_id)
     if not session:
-        return json.dumps({"error": "No active CDLM session. Call cdlm_init first."})
+        return _err("No active CDLM session. Call cdlm_init first.")
 
     err = _validate_transition(session, "conflict_check")
     if err:
-        return json.dumps({"error": err})
+        return _err(err, session)
+
+    if not isinstance(is_conflict, bool):
+        return _err("is_conflict must be a boolean.", session)
 
     m = session["modules"]
-    conflict_agent = session["agents"]["conflict"]
-    problem = session["problem"]
     tree = session["tree"]
+    Conflict = m["Conflict"]
 
-    user_prompt = Template(m["conflict_detection_user_prompt"]).substitute({
-        "PROBLEM": str(problem),
-        "REASONING_TREE": str(tree),
-    })
+    if is_conflict:
+        if not parents:
+            return _err(
+                "is_conflict=True requires a non-empty 'parents' list "
+                "containing the node IDs that jointly cause the conflict.",
+                session,
+            )
+        if not isinstance(parents, list) or not all(isinstance(p, int) for p in parents):
+            return _err("parents must be a list of integers.", session)
+        missing = [p for p in parents if p not in tree.nodes]
+        if missing:
+            return _err(
+                f"parents reference unknown node IDs: {missing}. "
+                f"Existing IDs: {sorted(tree.nodes.keys())}",
+                session,
+            )
 
-    conflict = conflict_agent.run_sync(user_prompt).output
-
-    if conflict.is_conflict:
+        conflict = Conflict(
+            reasoning=reasoning or "",
+            is_conflict=True,
+            parents=list(parents),
+        )
         tree.append_deductions(conflict)
         session["state"] = "CONFLICT"
         return json.dumps({
             "success": True,
             "is_conflict": True,
-            "reasoning": conflict.reasoning,
-            "message": "Conflict detected! You must call cdlm_backtrack next.",
+            "reasoning": reasoning or "",
+            "conflict_node_id": tree.conflict_id,
+            "message": "Conflict recorded. You MUST call cdlm_backtrack next.",
             "status": _tree_summary(session),
+            "allowed_actions": _allowed_actions(session),
             "tree": str(tree),
         })
-    else:
-        session["state"] = "NO_CONFLICT"
-        return json.dumps({
-            "success": True,
-            "is_conflict": False,
-            "reasoning": conflict.reasoning,
-            "message": "No conflict. You can propagate more, check for a solution, or make a decision.",
-            "status": _tree_summary(session),
-        })
+
+    session["state"] = "NO_CONFLICT"
+    return json.dumps({
+        "success": True,
+        "is_conflict": False,
+        "reasoning": reasoning or "",
+        "message": "No conflict. You can propagate more, check for a solution, or make a decision.",
+        "status": _tree_summary(session),
+        "allowed_actions": _allowed_actions(session),
+    })
 
 
-def cdlm_decide(**kwargs) -> str:
-    """Make an assumption/decision to explore the search space."""
+def cdlm_decide(text: str, reasoning: str = "", **kwargs) -> str:
+    """Add a caller-chosen assumption (decision) to the tree.
+
+    A decision opens a new decision level. Use the most-constrained-variable
+    heuristic to pick what to decide on.
+    """
     task_id = kwargs.get("task_id", "default")
     session = _get_session(task_id)
     if not session:
-        return json.dumps({"error": "No active CDLM session. Call cdlm_init first."})
+        return _err("No active CDLM session. Call cdlm_init first.")
 
     err = _validate_transition(session, "decide")
     if err:
-        return json.dumps({"error": err})
+        return _err(err, session)
+
+    if not text or not text.strip():
+        return _err("decision 'text' is required and cannot be empty.", session)
 
     m = session["modules"]
-    decision_agent = session["agents"]["decision"]
-    problem = session["problem"]
     tree = session["tree"]
+    Decision = m["Decision"]
 
-    user_prompt = Template(m["decision_user_prompt"]).substitute({
-        "PROBLEM": str(problem),
-        "REASONING_TREE": str(tree),
-        "DEFINITION": DEFAULT_DECISION,
-    })
+    decision = Decision(reasoning=reasoning or "", text=text)
+    nodes_before = set(tree.nodes.keys())
+    tree.append_deductions(decision)
+    nodes_after = set(tree.nodes.keys())
+    new_ids = sorted(nodes_after - nodes_before)
 
-    from pydantic_ai.usage import UsageLimits
-    from pydantic_ai.exceptions import UsageLimitExceeded
-
-    decision = None
-    try:
-        decision = decision_agent.run_sync(
-            user_prompt, usage_limits=UsageLimits(tool_calls_limit=5)
-        ).output
-    except UsageLimitExceeded as e:
-        logger.warning("Usage limit hit on decision agent: %s", e)
-
-    if decision and decision.text:
-        tree.append_deductions(decision)
-        session["state"] = "DECIDED"
-        return json.dumps({
-            "success": True,
-            "decision": decision.text,
-            "reasoning": decision.reasoning,
-            "status": _tree_summary(session),
-            "tree": str(tree),
-        })
-    else:
+    if not new_ids:
         return json.dumps({
             "success": False,
-            "message": "Decision agent returned empty decision. Try propagating more first.",
+            "message": "Decision was not added (likely a duplicate of an existing node). Try a different decision.",
             "status": _tree_summary(session),
+            "allowed_actions": _allowed_actions(session),
         })
 
+    session["state"] = "DECIDED"
+    return json.dumps({
+        "success": True,
+        "decision_node_id": new_ids[-1],
+        "decision_text": text,
+        "reasoning": reasoning or "",
+        "decision_level": tree.curr_decision_level,
+        "status": _tree_summary(session),
+        "allowed_actions": _allowed_actions(session),
+        "tree": str(tree),
+    })
 
-def cdlm_solution_check(**kwargs) -> str:
-    """Check if the problem has been solved by the current reasoning tree."""
+
+def cdlm_solution_check(
+    is_solution: bool,
+    reasoning: str = "",
+    solution_text: Optional[str] = None,
+    **kwargs,
+) -> str:
+    """Record whether the caller believes the current tree is a complete solution."""
     task_id = kwargs.get("task_id", "default")
     session = _get_session(task_id)
     if not session:
-        return json.dumps({"error": "No active CDLM session. Call cdlm_init first."})
+        return _err("No active CDLM session. Call cdlm_init first.")
 
     err = _validate_transition(session, "solution_check")
     if err:
-        return json.dumps({"error": err})
+        return _err(err, session)
 
-    m = session["modules"]
-    solution_agent = session["agents"]["solution"]
-    problem = session["problem"]
-    tree = session["tree"]
+    if not isinstance(is_solution, bool):
+        return _err("is_solution must be a boolean.", session)
 
-    user_prompt = Template(m["solution_checker_user_prompt"]).substitute({
-        "PROBLEM": str(problem),
-        "REASONING_TREE": str(tree),
-    })
-
-    solution = solution_agent.run_sync(user_prompt).output
-
-    if solution.is_solution:
+    if is_solution:
+        if not solution_text or not solution_text.strip():
+            return _err(
+                "is_solution=True requires 'solution_text' (the final answer).",
+                session,
+            )
         session["state"] = "SOLVED"
         return json.dumps({
             "success": True,
             "is_solution": True,
-            "solution": solution.solution_text,
-            "message": "Problem solved!",
+            "solution": solution_text,
+            "reasoning": reasoning or "",
+            "message": "Problem solved. Session is terminal.",
             "status": _tree_summary(session),
-        })
-    else:
-        # Stay in NO_CONFLICT — user can still propagate, decide, or check again
-        return json.dumps({
-            "success": True,
-            "is_solution": False,
-            "reasoning": solution.reasoning,
-            "message": "Not yet solved. Continue propagating or make a decision.",
-            "status": _tree_summary(session),
+            "allowed_actions": _allowed_actions(session),
         })
 
+    # Stay in NO_CONFLICT — caller can still propagate, decide, or check again.
+    return json.dumps({
+        "success": True,
+        "is_solution": False,
+        "reasoning": reasoning or "",
+        "message": "Not yet solved. Continue propagating or make a decision.",
+        "status": _tree_summary(session),
+        "allowed_actions": _allowed_actions(session),
+    })
 
-def cdlm_backtrack(**kwargs) -> str:
-    """Analyze the conflict, learn a lemma, and backjump."""
+
+def cdlm_backtrack(lemma: str, **kwargs) -> str:
+    """Run conflict analysis, backjump, and record the caller-supplied lemma.
+
+    Conflict analysis (1-UIP, learned clause, backjump level) is computed
+    deterministically from the implication graph. The caller is responsible
+    for translating the learned clause into a human-readable ``lemma`` — a
+    constraint that prevents this conflict from recurring.
+    """
     task_id = kwargs.get("task_id", "default")
     session = _get_session(task_id)
     if not session:
-        return json.dumps({"error": "No active CDLM session. Call cdlm_init first."})
+        return _err("No active CDLM session. Call cdlm_init first.")
 
     err = _validate_transition(session, "backtrack")
     if err:
-        return json.dumps({"error": err})
+        return _err(err, session)
+
+    if not lemma or not lemma.strip():
+        return _err(
+            "lemma is required: provide a concise constraint that prevents "
+            "this conflict from recurring (e.g., 'Cell(1,2) != 1').",
+            session,
+        )
 
     m = session["modules"]
     tree = session["tree"]
     problem = session["problem"]
-    lemma_agent = session["agents"]["lemma"]
+
+    if tree.conflict_id is None:
+        return _err("No conflict to analyze (tree.conflict_id is None).", session)
 
     try:
-        learned_clause, uip_node_id, backjump_level = m["analyze_and_print"](tree)
-        if learned_clause is None:
-            return json.dumps({
-                "error": "Could not analyze conflict.",
-                "status": _tree_summary(session),
-            })
+        analyzer = m["ConflictAnalyzer"](tree)
+        learned_clause, uip_node_id, backjump_level = analyzer.analyze_conflict(
+            tree.conflict_id
+        )
+    except Exception as exc:
+        logger.exception("Conflict analysis failed: %s", exc)
+        return _err(f"Conflict analysis failed: {type(exc).__name__}: {exc}", session)
 
-        # Build constraint string from learned clause
-        constraint_parts = []
-        for nid in sorted(learned_clause):
-            if nid in tree.nodes:
-                constraint_parts.append(tree.nodes[nid].text)
+    # Snapshot the learned-clause literals BEFORE we mutate the tree.
+    learned_clause_literals = [
+        {"id": nid, "text": tree.nodes[nid].text, "level": tree.nodes[nid].decision_level}
+        for nid in sorted(learned_clause)
+        if nid in tree.nodes
+    ]
+    uip_text = tree.nodes[uip_node_id].text if uip_node_id in tree.nodes else None
 
-        if not constraint_parts:
-            return json.dumps({
-                "error": "No valid nodes in learned clause.",
-                "status": _tree_summary(session),
-            })
+    # Backjump: drop everything above the backjump level. Tree.remove_nodes
+    # has a quirk where backjump_level==0 leaves curr_decision_level at 1
+    # (so the next propagation batch would file at level 1 instead of 0);
+    # snap it back to the actual backjump level here so level-0 propagations
+    # post-backjump are filed correctly.
+    tree.remove_nodes(backjump_level)
+    tree.curr_decision_level = backjump_level
 
-        # Learn a new lemma
-        user_prompt = Template(m["lemma_deducer_user_prompt"]).substitute({
-            "PROBLEM": str(problem),
-            "CONSTRAINTS": f"  NOT({' AND '.join(constraint_parts)})",
-        })
+    # Persist the lemma so future propagations are informed by it.
+    problem.lemmas.append(lemma)
 
-        # Backjump: remove nodes above the backjump level
-        tree.remove_nodes(backjump_level)
+    # After backtrack, the caller can propagate again (or immediately
+    # conflict-check if they want — PROPAGATED allows both).
+    session["state"] = "PROPAGATED"
 
-        # Extract lemma
-        lemma = lemma_agent.run_sync(user_prompt).output
-        problem.lemmas.append(lemma)
-
-        session["state"] = "PROPAGATED"  # After backtrack, can propagate again
-
-        return json.dumps({
-            "success": True,
-            "learned_lemma": lemma,
-            "backjump_level": backjump_level,
-            "uip_node": uip_node_id,
-            "learned_clause_nodes": sorted(learned_clause),
-            "message": f"Backtracked to level {backjump_level}. Learned lemma: {lemma}",
-            "status": _tree_summary(session),
-            "tree": str(tree),
-        })
-
-    except Exception as e:
-        logger.exception("Error during conflict analysis: %s", e)
-        return json.dumps({
-            "error": f"Conflict analysis failed: {type(e).__name__}: {e}",
-            "status": _tree_summary(session),
-        })
+    return json.dumps({
+        "success": True,
+        "learned_lemma": lemma,
+        "backjump_level": backjump_level,
+        "uip_node_id": uip_node_id,
+        "uip_text": uip_text,
+        "learned_clause": learned_clause_literals,
+        "message": (
+            f"Backjumped to level {backjump_level}. "
+            f"Lemma stored: {lemma}"
+        ),
+        "status": _tree_summary(session),
+        "allowed_actions": _allowed_actions(session),
+        "tree": str(tree),
+    })
 
 
 def cdlm_status(**kwargs) -> str:
-    """Show current CDLM session state."""
+    """Show the current CDLM session state."""
     task_id = kwargs.get("task_id", "default")
     session = _get_session(task_id)
     if not session:
-        return json.dumps({"error": "No active CDLM session. Call cdlm_init first."})
-
-    state = session["state"]
-    allowed = sorted(VALID_TRANSITIONS.get(state, set()))
+        return _err("No active CDLM session. Call cdlm_init first.")
 
     return json.dumps({
-        "state": state,
-        "allowed_actions": allowed,
+        "state": session["state"],
+        "allowed_actions": _allowed_actions(session),
         "problem": str(session["problem"]),
         "tree": str(session["tree"]),
         "status": _tree_summary(session),
@@ -474,20 +519,18 @@ def cdlm_status(**kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Availability gate
+# Availability gate (toggled by /cdlm slash command)
 # ---------------------------------------------------------------------------
 
 _cdlm_active = False
 
 
 def activate_cdlm():
-    """Enable CDLM tools for this process."""
     global _cdlm_active
     _cdlm_active = True
 
 
 def deactivate_cdlm():
-    """Disable CDLM tools for this process."""
     global _cdlm_active
     _cdlm_active = False
 
@@ -505,7 +548,9 @@ CDLM_INIT_SCHEMA = {
     "description": (
         "Initialize a CDLM (Conflict-Driven Learning) session for solving a "
         "combinatorial reasoning problem. Provide the problem statement as text. "
-        "This sets up the reasoning tree and LLM agents needed for the solve loop."
+        "The reasoning tree starts empty; you (the caller) drive each phase by "
+        "calling cdlm_propagate / cdlm_conflict_check / cdlm_decide / "
+        "cdlm_solution_check / cdlm_backtrack."
     ),
     "parameters": {
         "type": "object",
@@ -516,7 +561,7 @@ CDLM_INIT_SCHEMA = {
             },
             "problem_type": {
                 "type": "string",
-                "description": "Type of problem: 'general' (default) or 'sudoku'.",
+                "description": "Optional label for the problem type (e.g. 'sudoku', 'general').",
                 "default": "general",
             },
         },
@@ -527,67 +572,150 @@ CDLM_INIT_SCHEMA = {
 CDLM_PROPAGATE_SCHEMA = {
     "name": "cdlm_propagate",
     "description": (
-        "Derive logical implications (deductions) from the current reasoning tree. "
-        "Can be called multiple times before checking for conflicts. "
-        "Each call adds new nodes to the implication graph."
+        "Add implications you have derived from the current reasoning tree. "
+        "Pass a list of {text, reasoning, parents} objects. Each deduction must "
+        "be atomic (one fact per item) and must cite the IDs of the existing "
+        "nodes that imply it (use [] for the initial level-0 givens that come "
+        "directly from the problem statement). Can be called multiple times "
+        "before checking for conflicts."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
-        "required": [],
+        "properties": {
+            "deductions": {
+                "type": "array",
+                "description": "List of implications to add to the tree.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The atomic implication, e.g. 'Cell(0,1) = 2'.",
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Why this follows from the parents.",
+                        },
+                        "parents": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": (
+                                "Node IDs that jointly imply this deduction. "
+                                "Use [] for level-0 givens with no antecedents."
+                            ),
+                        },
+                    },
+                    "required": ["text", "parents"],
+                },
+            },
+        },
+        "required": ["deductions"],
     },
 }
 
 CDLM_CONFLICT_CHECK_SCHEMA = {
     "name": "cdlm_conflict_check",
     "description": (
-        "Check the reasoning tree for contradictions. Must be called after at least "
-        "one propagation. If a conflict is found, you MUST call cdlm_backtrack next."
+        "Record whether you have identified a contradiction in the reasoning "
+        "tree. If is_conflict=True, you MUST supply 'parents' — the node IDs "
+        "whose joint assignments produce the contradiction (these seed the "
+        "conflict analysis). After a conflict, the only legal next action is "
+        "cdlm_backtrack."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
-        "required": [],
+        "properties": {
+            "is_conflict": {
+                "type": "boolean",
+                "description": "True if a contradiction has been identified.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Explanation of the contradiction (or why none exists).",
+            },
+            "parents": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": (
+                    "Required when is_conflict=True. Node IDs that jointly "
+                    "cause the contradiction."
+                ),
+            },
+        },
+        "required": ["is_conflict"],
     },
 }
 
 CDLM_DECIDE_SCHEMA = {
     "name": "cdlm_decide",
     "description": (
-        "Make an assumption/decision to explore the solution space. Only available "
-        "after a conflict check finds no conflict. Increments the decision level."
+        "Add a caller-chosen assumption to the tree to explore the search "
+        "space. A decision opens a new decision level. Only available after "
+        "cdlm_conflict_check finds no conflict. Prefer the most-constrained "
+        "variable (fewest remaining options) for the next decision."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
-        "required": [],
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "The assumption, e.g. 'Cell(1,2) = 1'.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Why this is a good decision to try.",
+            },
+        },
+        "required": ["text"],
     },
 }
 
 CDLM_SOLUTION_CHECK_SCHEMA = {
     "name": "cdlm_solution_check",
     "description": (
-        "Check if the current reasoning tree constitutes a complete solution. "
-        "Only available after a conflict check finds no conflict."
+        "Record whether the current reasoning tree constitutes a complete "
+        "solution. Only available after cdlm_conflict_check finds no conflict. "
+        "If is_solution=True, supply solution_text with the final answer."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
-        "required": [],
+        "properties": {
+            "is_solution": {
+                "type": "boolean",
+                "description": "True if the problem is solved.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Explanation of why the tree is (not) a complete solution.",
+            },
+            "solution_text": {
+                "type": "string",
+                "description": "Required when is_solution=True. The final answer.",
+            },
+        },
+        "required": ["is_solution"],
     },
 }
 
 CDLM_BACKTRACK_SCHEMA = {
     "name": "cdlm_backtrack",
     "description": (
-        "Analyze the conflict in the reasoning tree, find the 1-UIP, learn a new "
-        "lemma (constraint), and backjump to an earlier decision level. Only available "
-        "when a conflict has been detected."
+        "After a conflict, run conflict analysis (1-UIP / learned clause / "
+        "backjump level is computed deterministically from the tree), drop "
+        "every node above the backjump level, and store the caller-supplied "
+        "lemma so future propagations are informed by it. The lemma should be "
+        "a concise constraint that prevents this conflict from recurring "
+        "(e.g. 'Cell(1,2) != 1')."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
-        "required": [],
+        "properties": {
+            "lemma": {
+                "type": "string",
+                "description": "Concise human-readable constraint learned from the conflict.",
+            },
+        },
+        "required": ["lemma"],
     },
 }
 
@@ -627,7 +755,10 @@ registry.register(
     name="cdlm_propagate",
     toolset="cdlm",
     schema=CDLM_PROPAGATE_SCHEMA,
-    handler=lambda args, **kw: cdlm_propagate(**kw),
+    handler=lambda args, **kw: cdlm_propagate(
+        deductions=args.get("deductions", []),
+        **kw,
+    ),
     check_fn=check_cdlm_available,
     emoji="🔗",
 )
@@ -636,7 +767,12 @@ registry.register(
     name="cdlm_conflict_check",
     toolset="cdlm",
     schema=CDLM_CONFLICT_CHECK_SCHEMA,
-    handler=lambda args, **kw: cdlm_conflict_check(**kw),
+    handler=lambda args, **kw: cdlm_conflict_check(
+        is_conflict=args.get("is_conflict", False),
+        reasoning=args.get("reasoning", ""),
+        parents=args.get("parents"),
+        **kw,
+    ),
     check_fn=check_cdlm_available,
     emoji="⚡",
 )
@@ -645,7 +781,11 @@ registry.register(
     name="cdlm_decide",
     toolset="cdlm",
     schema=CDLM_DECIDE_SCHEMA,
-    handler=lambda args, **kw: cdlm_decide(**kw),
+    handler=lambda args, **kw: cdlm_decide(
+        text=args.get("text", ""),
+        reasoning=args.get("reasoning", ""),
+        **kw,
+    ),
     check_fn=check_cdlm_available,
     emoji="🎯",
 )
@@ -654,7 +794,12 @@ registry.register(
     name="cdlm_solution_check",
     toolset="cdlm",
     schema=CDLM_SOLUTION_CHECK_SCHEMA,
-    handler=lambda args, **kw: cdlm_solution_check(**kw),
+    handler=lambda args, **kw: cdlm_solution_check(
+        is_solution=args.get("is_solution", False),
+        reasoning=args.get("reasoning", ""),
+        solution_text=args.get("solution_text"),
+        **kw,
+    ),
     check_fn=check_cdlm_available,
     emoji="✅",
 )
@@ -663,7 +808,10 @@ registry.register(
     name="cdlm_backtrack",
     toolset="cdlm",
     schema=CDLM_BACKTRACK_SCHEMA,
-    handler=lambda args, **kw: cdlm_backtrack(**kw),
+    handler=lambda args, **kw: cdlm_backtrack(
+        lemma=args.get("lemma", ""),
+        **kw,
+    ),
     check_fn=check_cdlm_available,
     emoji="↩️",
 )

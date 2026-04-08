@@ -84,20 +84,63 @@ search space.
 ## CDLM Tools
 
 When this skill is activated via `/cdlm`, you have access to the following tools.
-**You MUST use these tools to execute the solver loop — do not try to reason
-through the problem manually.**
+**You MUST use these tools to execute the solver loop and drive every phase
+yourself.** The tools do not call any external LLM — *you* are the reasoning
+engine, and the tools handle state-machine validation, tree bookkeeping, and
+the deterministic conflict-analysis math (1-UIP, learned clause, backjump
+level). No API keys are required.
 
 ### Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `cdlm_init` | Initialize a session with a problem statement. Call this first. |
-| `cdlm_propagate` | Derive logical implications from the current tree. Can be called multiple times. |
-| `cdlm_conflict_check` | Check for contradictions. Must call after propagating. |
-| `cdlm_solution_check` | Check if the problem is solved. Available after no-conflict. |
-| `cdlm_decide` | Make an assumption to explore the search space. Available after no-conflict. |
-| `cdlm_backtrack` | Analyze conflict, learn lemma, and backjump. Required after conflict. |
-| `cdlm_status` | Show current session state and allowed actions. |
+| `cdlm_init(problem_text, problem_type?)` | Initialize a session. Call this first. |
+| `cdlm_propagate(deductions)` | Add the implications **you** have derived. |
+| `cdlm_conflict_check(is_conflict, reasoning?, parents?)` | Record whether you found a contradiction. |
+| `cdlm_solution_check(is_solution, reasoning?, solution_text?)` | Record whether the tree is now a complete solution. |
+| `cdlm_decide(text, reasoning?)` | Add an assumption (decision) to explore. |
+| `cdlm_backtrack(lemma)` | Run conflict analysis, backjump, and store the lemma you learned. |
+| `cdlm_status()` | Show current session state, tree, and allowed actions. |
+
+### How the Tools Work
+
+You — the calling LLM — produce all of the *content* of each phase and pass
+it in as arguments. The tools produce all of the *structure*:
+
+* **`cdlm_propagate(deductions=[...])`** — pass a list of
+  `{text, reasoning, parents}` objects. Each entry must be **atomic** (one
+  fact per item) and must cite the IDs of existing tree nodes that imply it.
+  Use `parents=[]` for the initial level-0 givens that come straight from the
+  problem statement.
+
+* **`cdlm_conflict_check(is_conflict=True, reasoning=..., parents=[...])`** —
+  when you spot a contradiction, set `is_conflict=True` and supply the
+  `parents` list (the node IDs whose joint assignments produce the conflict).
+  These seed the conflict analysis. Use `is_conflict=False` to record that
+  the current state is consistent.
+
+* **`cdlm_decide(text=..., reasoning=...)`** — pick the most-constrained
+  variable and pass your assumption as `text`. This opens a new decision
+  level.
+
+* **`cdlm_solution_check(is_solution=True, solution_text=...)`** — when the
+  tree fully determines the answer, pass the final answer in `solution_text`.
+
+* **`cdlm_backtrack(lemma=...)`** — runs 1-UIP / learned clause / backjump
+  level computation deterministically from the implication graph, drops every
+  node above the backjump level, and stores **your** human-readable `lemma`
+  (e.g. `"Cell(1,2) != 1"`) so future propagations are informed by it. The
+  return value tells you the backjump level, the UIP node, and the literals
+  in the learned clause so you can confirm your reasoning.
+
+Each tool returns the current `state`, the `allowed_actions` list, and a
+serialized view of the tree, so you can always tell what's legal next.
+
+> **Node IDs are never recycled.** After `cdlm_backtrack` removes the nodes
+> above the backjump level, the next propagation gets the *next unused* ID,
+> not the lowest free one. Always read the latest tree (from the previous
+> tool's response or `cdlm_status`) to find the actual ID of any node you
+> want to cite as a parent.
 
 ### State Machine
 
@@ -117,13 +160,17 @@ which actions are allowed. Use `cdlm_status` at any time to see where you are.
 
 ### Typical Workflow
 
-1. `cdlm_init(problem_text="...")` — set up the session
-2. `cdlm_propagate` — call 1+ times until no new deductions emerge
-3. `cdlm_conflict_check` — check for contradictions
-4. If conflict: `cdlm_backtrack` → go to step 2
-5. If no conflict: `cdlm_solution_check` — check if solved
-6. If not solved: `cdlm_decide` → go to step 2
-7. If solved: report the solution
+1. `cdlm_init(problem_text="...")` — set up the session.
+2. `cdlm_propagate(deductions=[...])` — pass the level-0 givens (parents `[]`)
+   first, then call again to add deductions that follow from them. Repeat
+   until no further deductions are visible.
+3. `cdlm_conflict_check(is_conflict=..., parents=...)` — report whether you
+   spotted a contradiction.
+4. If conflict: `cdlm_backtrack(lemma="...")` → go to step 2.
+5. If no conflict: `cdlm_solution_check(is_solution=...)` — report whether
+   the tree fully solves the problem.
+6. If not solved: `cdlm_decide(text="...")` → go to step 2.
+7. If solved: report the solution.
 
 ### Key Principles
 
@@ -136,39 +183,47 @@ which actions are allowed. Use `cdlm_status` at any time to see where you are.
 - Each tool returns the current tree state and allowed next actions so you can
   track progress.
 
-## The Solver Loop (What the Tools Do Internally)
+## The Solver Loop (What You Do vs. What the Tools Do)
 
 ### Propagate
 
-Sends the current problem + tree to an LLM agent that extracts deductions:
-- Each deduction is **atomic** (one fact per node)
-- Has valid **parents** (which existing nodes imply it)
-- Is **new** (no duplicates)
-- Follows logically from its parents plus the problem rules
+**You** extract every deduction that follows from the current problem + tree
+and submit them via `cdlm_propagate(deductions=[...])`. Each deduction must:
+- Be **atomic** (one fact per node)
+- Cite valid **parents** (the existing node IDs that imply it)
+- Be **new** (the tool will skip duplicates by text)
+- Follow logically from its parents plus the problem rules and any known
+  lemmas
 
 ### Conflict Check
 
-An LLM agent examines the tree for contradictions. If found, a CONFLICT node
-is added to the tree with the conflicting nodes as parents.
+**You** examine the tree for contradictions and call
+`cdlm_conflict_check(is_conflict=..., reasoning=..., parents=[...])`. When
+`is_conflict=True`, the `parents` you supply become the parents of a CONFLICT
+node and seed the conflict analysis.
 
 ### Backtrack (Conflict Analysis + Backjump)
 
-When a conflict is detected, the tool automatically:
+When you call `cdlm_backtrack(lemma=...)`, the tool:
 1. Finds the **1-UIP** (First Unique Implication Point) via graph analysis
 2. Builds the **learned clause** from the conflict
 3. Calculates the **backjump level**
 4. Removes nodes above the backjump level
-5. Has an LLM agent extract a **learned lemma** from the constraint
-6. Adds the lemma to the problem's known constraints
+5. Stores **your** human-readable `lemma` in the problem's known constraints
+
+The 1-UIP, learned clause, and backjump level are all returned to you, so you
+can confirm the analysis matches your understanding of the conflict.
 
 ### Solution Check
 
-An LLM agent evaluates whether the current tree constitutes a complete solution.
+**You** evaluate whether the current tree constitutes a complete solution and
+call `cdlm_solution_check(is_solution=..., solution_text=...)`.
 
 ### Decide
 
-An LLM agent makes an informed assumption to explore the solution space,
-creating a new decision level in the tree.
+**You** pick a variable to assume (prefer the most-constrained one) and call
+`cdlm_decide(text=..., reasoning=...)`, which creates a new decision level in
+the tree.
 
 ## Output Requirements
 
